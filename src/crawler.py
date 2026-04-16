@@ -14,6 +14,7 @@ class CrawlConfig:
     allowed_domains: list[str]
 
     max_depth: int = 4
+    max_links: int | None = None
     interval_sec: float = 1.0
     headless: bool = True
     debug: bool = True
@@ -47,6 +48,7 @@ class CrawlConfig:
     max_viewport_y: int = 2200
 
     output_csv: str | None = None
+    overwrite_csv: bool = False
 
 
 class RateLimiter:
@@ -72,6 +74,7 @@ class GenericBFSCrawler:
         self.visited: set[str] = set()
         self.discovered: set[str] = set()
         self.results: list[dict] = []
+        self.link_count = 0
 
     # debugが有効な場合だけログを出力する。
     def log(self, *args):
@@ -97,14 +100,46 @@ class GenericBFSCrawler:
         if parsed.scheme not in ("http", "https"):
             return None
 
-        if not any(domain in parsed.netloc for domain in self.config.allowed_domains):
+        if not any(parsed.netloc == domain or parsed.netloc.endswith(f".{domain}") for domain in self.config.allowed_domains):
             return None
         
         if self.config.allowed_url_prefixes:
-            if not any(abs_url.startswith(prefix) for prefix in self.config.allowed_url_prefixes):
+            if not any(self._matches_url_prefix(abs_url, prefix) for prefix in self.config.allowed_url_prefixes):
                 return None
 
         return abs_url
+
+    # URLが設定されたprefixのパス配下にあるかを判定する。
+    def _matches_url_prefix(self, url: str, prefix: str) -> bool:
+        parsed_url = urlparse(url)
+        parsed_prefix = urlparse(prefix)
+
+        if parsed_url.scheme != parsed_prefix.scheme:
+            return False
+
+        if parsed_url.netloc != parsed_prefix.netloc:
+            return False
+
+        prefix_path = parsed_prefix.path.rstrip("/")
+        if not prefix_path:
+            return True
+
+        return parsed_url.path == prefix_path or parsed_url.path.startswith(f"{prefix_path}/")
+
+    # 最大リンク数が設定されている場合、残り何件追加できるかを返す。
+    def _remaining_link_slots(self) -> int | None:
+        if self.config.max_links is None:
+            return None
+
+        return max(self.config.max_links - self.link_count, 0)
+
+    # 最大リンク数に収まるようにリンク一覧を切り詰める。
+    def _limit_links(self, links: list[dict]) -> list[dict]:
+        remaining = self._remaining_link_slots()
+        if remaining is None:
+            return links
+
+        return links[:remaining]
 
     # ページタイトルを取得し、取得できない場合はog:titleを使う。
     def _get_title(self, page) -> str:
@@ -320,6 +355,22 @@ class GenericBFSCrawler:
         if not self.config.output_csv:
             return
 
+        output_dir = os.path.dirname(self.config.output_csv)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        if self.config.overwrite_csv:
+            with open(self.config.output_csv, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "source_url",
+                    "source_title",
+                    "depth",
+                    "target_url",
+                    "anchor_text",
+                ])
+            return
+
         file_exists = os.path.exists(self.config.output_csv)
         if file_exists and os.path.getsize(self.config.output_csv) > 0:
             return
@@ -392,6 +443,10 @@ class GenericBFSCrawler:
             )
 
             while queue:
+                if self.config.max_links is not None and self.link_count >= self.config.max_links:
+                    self.log(f"[STOP] max_links reached: {self.link_count}")
+                    break
+
                 url, depth = queue.popleft()
 
                 if url in self.visited:
@@ -410,6 +465,8 @@ class GenericBFSCrawler:
                     page.wait_for_timeout(self.config.initial_wait_ms)
 
                     record = self._extract_page(page, url, depth)
+                    record["links"] = self._limit_links(record["links"])
+                    self.link_count += len(record["links"])
                     self.results.append(record)
 
                     self._write_csv(
@@ -440,6 +497,8 @@ class GenericBFSCrawler:
 
         return self.results
 
+# ----
+
 def ocn_support():
     config = CrawlConfig(
         start_url="https://support.ocn.ne.jp/",
@@ -448,7 +507,7 @@ def ocn_support():
         interval_sec=1.0,
         headless=True,
         debug=True,
-        output_csv="ocn_support_links.csv",
+        output_csv="output/ocn_support_links.csv",
     )
 
     crawler = GenericBFSCrawler(config)
@@ -467,12 +526,14 @@ def docomo_faq():
     config = CrawlConfig(
          start_url="https://www.docomo.ne.jp/faq/",
          allowed_domains=["www.docomo.ne.jp"],
-         allowed_url_prefixes=["https://www.docomo.ne.jp/faq/"],
+         allowed_url_prefixes=["https://www.docomo.ne.jp/faq"],
          max_depth=4,
+         max_links=2500,
          interval_sec=1.0,
          headless=True,
          debug=True,
-         output_csv="docomo_faq_links.csv",
+         output_csv="output/docomo_faq_links.csv",
+         overwrite_csv=True,
      )
 
     crawler = GenericBFSCrawler(config)
@@ -497,7 +558,7 @@ def goo_point():
         headless=True,
         debug=True,
         enable_expand_click=False,
-        output_csv="point_d_goo_links.csv",
+        output_csv="output/point_d_goo_links.csv",
     )
     crawler = GenericBFSCrawler(config)
     results = crawler.crawl()
@@ -521,7 +582,7 @@ def gooID():
         headless=True,
         debug=True,
         enable_expand_click=False,
-        output_csv="gooID_links.csv",
+        output_csv="output/gooID_links.csv",
     )
     crawler = GenericBFSCrawler(config)
     results = crawler.crawl()
@@ -536,8 +597,8 @@ def gooID():
         })
 
 if __name__ == "__main__":
-    gooID()
+    #gooID()
     #goo_point()
     #ocn_support()
-    #docomo_faq()
+    docomo_faq()
     
