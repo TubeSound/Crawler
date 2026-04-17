@@ -611,10 +611,34 @@ def gooID():
             "url": r["url"],
             "link_count": len(r["links"]),
         })
+        
+def docomo_denki():
+    # gooIDログイン画面配下をクリック展開なしでクロールする。
+    config = CrawlConfig(
+        start_url="https://denki.docomo.ne.jp",
+        allowed_domains = ["denki.docomo.ne.jp"],
+        max_depth=5,
+        interval_sec=1.0,
+        headless=True,
+        debug=True,
+        enable_expand_click=True,
+        output_csv="output/docomo_denki_links.csv",
+    )
+    crawler = GenericBFSCrawler(config)
+    results = crawler.crawl()
+
+    print(f"\nCRAWLED PAGES: {len(results)}")
+    for r in results[:5]:
+        print({
+            "depth": r["depth"],
+            "title": r["title"],
+            "url": r["url"],
+            "link_count": len(r["links"]),
+        })
 
 if __name__ == "__main__":
     #gooID()
     #goo_point()
-    ocn_support()
+    #ocn_support()
     #docomo_faq()
-    
+    docomo_denki()

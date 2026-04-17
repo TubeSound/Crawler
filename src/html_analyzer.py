@@ -7,6 +7,7 @@ import math
 import re
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -187,16 +188,20 @@ def compute_js_dynamic_ui_score(
     return score
 
 
-def is_unrendered_nuxt_shell(html: str) -> bool:
-    soup = BeautifulSoup(html, "html.parser")
+def get_body_text_length(html: str, parser: str = "html.parser") -> int:
+    soup = BeautifulSoup(html, parser)
     body = soup.body
     if body is None:
-        return False
+        return 0
+    return get_tag_text_len(body)
 
-    has_nuxt_root = body.find(id="__nuxt") is not None
-    has_nuxt_data = soup.find("script", id="__NUXT_DATA__") is not None
-    body_text_len = get_tag_text_len(body)
-    return has_nuxt_root and has_nuxt_data and body_text_len == 0
+
+def is_empty_body(html: str, parser: str = "html.parser") -> bool:
+    soup = BeautifulSoup(html, parser)
+    body = soup.body
+    if body is None:
+        return True
+    return get_tag_text_len(body) == 0
 
 
 class PlaywrightHtmlRenderer:
@@ -254,7 +259,7 @@ class PlaywrightHtmlRenderer:
                     const text = (body.innerText || '').trim();
                     return text.length > 0 && (
                         document.querySelector('main, section, h1, h2, h3') ||
-                        !document.querySelector('#__nuxt:empty')
+                        document.body.childElementCount > 0
                     );
                 }""",
                 timeout=self.wait_timeout_ms,
@@ -272,12 +277,18 @@ def render_html_with_playwright(url: str, wait_timeout_ms: int = 15000) -> str:
         return renderer.render(url)
 
 
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
 @dataclass
 class HtmlStructureMetrics:
     url: Optional[str]
     url_depth: int
     title: str
     total_text_length: int
+    body_text_length: int
+    empty_body: int
     link_count: int
     link_text_ratio: float
     section_count: int
@@ -290,13 +301,66 @@ class HtmlStructureMetrics:
     h3_count: int
     section_with_heading_ratio: float
     dominant_segmentation_type: str
-    unrendered_nuxt_shell: int
     hidden_element_count: int
     accordion_like_count: int
     modal_like_count: int
     js_event_handler_count: int
     script_ui_keyword_count: int
     js_dynamic_ui_score: int
+
+
+@dataclass
+class AnalyzerJob:
+    html_dir: str
+    output_csv: str
+    output_jsonl: str
+    rendered_html_dir: str
+    limit: int | None = None
+    render_mode: str = "fast"
+
+
+# 普段はここを書き換えるだけで解析対象を切り替える。
+# render_mode:
+#   off       = 保存済みHTMLだけを解析する
+#   fast      = bodyが空のページだけPlaywrightでレンダリングする
+#   precision = 全ページをPlaywrightでレンダリングする
+ACTIVE_JOB = "ocn_support" #"docomo_faq"
+USE_CLI_ARGS = False
+
+ANALYZER_JOBS: dict[str, AnalyzerJob] = {
+    "docomo_faq": AnalyzerJob(
+        html_dir="output/docomo_faq/html",
+        output_csv="output/docomo_faq/feature/docomo_faq_feature.csv",
+        output_jsonl="output/docomo_faq/feature/docomo_faq_feature.jsonl",
+        rendered_html_dir="output/docomo_faq/rendered_html",
+        limit=None,
+        render_mode="fast",
+    ),
+    "point_goo": AnalyzerJob(
+        html_dir="output/point_goo/rendered_html",
+        output_csv="output/point_goo/feature/point_goo_feature.csv",
+        output_jsonl="output/point_goo/feature/point_goo_feature.jsonl",
+        rendered_html_dir="output/point_goo/rendered_html",
+        limit=None,
+        render_mode="off",
+    ),
+    "gooID": AnalyzerJob(
+        html_dir="output/gooID/rendered_html",
+        output_csv="output/gooID/feature/gooID_feature.csv",
+        output_jsonl="output/gooID/feature/gooID_feature.jsonl",
+        rendered_html_dir="output/gooID/rendered_html",
+        limit=None,
+        render_mode="off",
+    ),
+    "ocn_support": AnalyzerJob(
+        html_dir="output/ocn_support/html",
+        output_csv="output/ocn_support/feature/ocn_support_feature.csv",
+        output_jsonl="output/ocn_support/feature/ocn_support_feature.jsonl",
+        rendered_html_dir="output/ocn_support/rendered_html",
+        limit=None,
+        render_mode="off",
+    ),
+}
 
 
 class AnalyzeHtmlStructure:
@@ -310,27 +374,39 @@ class AnalyzeHtmlStructure:
         self.min_block_ratio = min_block_ratio
         self.div_min_text_len = div_min_text_len
 
-    def analyze(self, html: str, url: Optional[str] = None) -> HtmlStructureMetrics:
-        unrendered_nuxt_shell = int(is_unrendered_nuxt_shell(html))
+    # --- 修正：analyze() を置き換え ---
+
+    def analyze(self, html: str, url: Optional[str] = None):
+        body_text_length = get_body_text_length(html, parser=self.parser)
+        empty_body = int(body_text_length == 0)
+
         soup = BeautifulSoup(html, self.parser)
         self._remove_non_content_nodes(soup)
+
+        # ★追加
+        section_outline = self._extract_section_outline(soup)
 
         total_text_length = get_tag_text_len(soup)
         title = normalize_text(soup.title.get_text(" ", strip=True)) if soup.title else ""
 
         links = soup.find_all("a")
         link_text_length = sum(get_tag_text_len(a) for a in links)
+
         section_tags = soup.find_all("section")
         main_text_length = sum(get_tag_text_len(tag) for tag in soup.find_all("main"))
         section_text_length_total = sum(get_tag_text_len(tag) for tag in section_tags)
+
         section_with_heading_count = sum(
             1 for tag in section_tags if has_heading_descendant(tag)
         )
+
         hidden_element_count = sum(1 for tag in soup.find_all(True) if is_hidden_like(tag))
         accordion_like_count = sum(1 for tag in soup.find_all(True) if is_accordion_like(tag))
         modal_like_count = sum(1 for tag in soup.find_all(True) if is_modal_like(tag))
+
         js_event_handler_count = count_event_handler_attrs(soup)
         script_ui_keyword_count = count_script_ui_keywords(soup)
+
         js_dynamic_ui_score = compute_js_dynamic_ui_score(
             hidden_element_count=hidden_element_count,
             accordion_like_count=accordion_like_count,
@@ -339,11 +415,13 @@ class AnalyzeHtmlStructure:
             script_ui_keyword_count=script_ui_keyword_count,
         )
 
-        return HtmlStructureMetrics(
+        metrics = HtmlStructureMetrics(
             url=url,
             url_depth=count_url_depth(url) if url else 0,
             title=title,
             total_text_length=total_text_length,
+            body_text_length=body_text_length,
+            empty_body=empty_body,
             link_count=len(links),
             link_text_ratio=safe_div(link_text_length, total_text_length),
             section_count=len(section_tags),
@@ -362,7 +440,6 @@ class AnalyzeHtmlStructure:
                 soup,
                 total_text_length,
             ),
-            unrendered_nuxt_shell=unrendered_nuxt_shell,
             hidden_element_count=hidden_element_count,
             accordion_like_count=accordion_like_count,
             modal_like_count=modal_like_count,
@@ -370,6 +447,28 @@ class AnalyzeHtmlStructure:
             script_ui_keyword_count=script_ui_keyword_count,
             js_dynamic_ui_score=js_dynamic_ui_score,
         )
+
+        # ★変更：tupleで返す
+        return metrics, section_outline
+        
+    # --- 追加：AnalyzeHtmlStructure 内にこの関数を追加 ---
+
+    def _extract_section_outline(self, soup: BeautifulSoup) -> str:
+        outlines: list[list[str]] = []
+
+        sections = soup.find_all("section")
+
+        # sectionが無ければ全体を1セクション扱い
+        if not sections:
+            sections = [soup]
+
+        for section in sections:
+            headings: list[str] = []
+            for tag in section.find_all(["h1", "h2", "h3"]):
+                headings.append(tag.name)
+            outlines.append(headings)
+
+        return json.dumps(outlines, ensure_ascii=False)    
 
     def analyze_file(
         self,
@@ -576,25 +675,77 @@ class AnalyzeHtmlStructure:
 def iter_archived_html(html_dir: str | Path, limit: int | None = None):
     html_dir = Path(html_dir)
     meta_paths = sorted(html_dir.glob("*.meta.json"))
+    rendered_html_paths = sorted(html_dir.glob("*.rendered.html"))
+
+    if not html_dir.exists():
+        print(f"[WARN] html_dir not found: {html_dir}")
+        return
+
+    if not meta_paths and not rendered_html_paths:
+        print(f"[WARN] no .meta.json files found in: {html_dir}")
+        return
+
+    if meta_paths:
+        if limit is not None:
+            meta_paths = meta_paths[:limit]
+
+        for meta_path in meta_paths:
+            key = meta_path.name.removesuffix(".meta.json")
+            html_path = html_dir / f"{key}.html"
+
+            if not html_path.exists():
+                print(f"[SKIP] html not found: {html_path}")
+                continue
+
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            html = html_path.read_text(encoding="utf-8")
+
+            yield {
+                "key": key,
+                "meta_path": str(meta_path),
+                "html_path": str(html_path),
+                "meta": meta,
+                "html": html,
+            }
+        return
 
     if limit is not None:
-        meta_paths = meta_paths[:limit]
+        rendered_html_paths = rendered_html_paths[:limit]
 
-    for meta_path in meta_paths:
-        key = meta_path.name.removesuffix(".meta.json")
-        html_path = html_dir / f"{key}.html"
+    for rendered_html_path in rendered_html_paths:
+        key = rendered_html_path.name.removesuffix(".rendered.html")
+        rendered_meta_path = html_dir / f"{key}.rendered.meta.json"
+        archived_html_path = html_dir.parent / "html" / f"{key}.html"
+        source_meta_path = html_dir.parent / "html" / f"{key}.meta.json"
 
-        if not html_path.exists():
-            print(f"[SKIP] html not found: {html_path}")
-            continue
+        if source_meta_path.exists():
+            source_meta = json.loads(source_meta_path.read_text(encoding="utf-8"))
+        else:
+            source_meta = {
+                "url": "",
+                "fetched_at": "",
+                "http_status": "",
+                "content_type": "",
+            }
 
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        html = html_path.read_text(encoding="utf-8")
+        if not rendered_meta_path.exists():
+            write_rendered_meta(
+                path=rendered_meta_path,
+                source_meta=source_meta,
+                key=key,
+                url=source_meta.get("url", ""),
+                archived_html_path=str(archived_html_path) if archived_html_path.exists() else "",
+                rendered_html_path=str(rendered_html_path),
+                render_mode="cached",
+            )
+
+        meta = json.loads(rendered_meta_path.read_text(encoding="utf-8"))
+        html = rendered_html_path.read_text(encoding="utf-8")
 
         yield {
             "key": key,
-            "meta_path": str(meta_path),
-            "html_path": str(html_path),
+            "meta_path": str(rendered_meta_path),
+            "html_path": str(rendered_html_path),
             "meta": meta,
             "html": html,
         }
@@ -624,48 +775,95 @@ def analyze_archived_html_dir(
             html = item["html"]
             analysis_source = "archived_html"
             analyzed_html_path = item["html_path"]
+            rendered_meta_path = ""
             render_error = ""
 
-            archived_unrendered_nuxt_shell = int(is_unrendered_nuxt_shell(item["html"]))
+            if item["meta_path"].endswith(".rendered.meta.json"):
+                analysis_source = "playwright_rendered_cached"
+                rendered_meta_path = item["meta_path"]
+
+            archived_body_text_length = get_body_text_length(item["html"])
+            archived_empty_body = int(archived_body_text_length == 0)
             should_render = False
 
             if render_mode == "precision" and url:
                 should_render = True
-            elif render_mode == "fast" and url and archived_unrendered_nuxt_shell:
+            elif render_mode == "fast" and url and archived_empty_body:
                 should_render = True
 
             if should_render and renderer:
-                if render_mode == "fast" and archived_unrendered_nuxt_shell:
-                    print(f"[RENDER] archived HTML is an empty Nuxt shell: {url}")
+                rendered_html_path = (
+                    rendered_html_base / f"{item['key']}.rendered.html"
+                    if rendered_html_base
+                    else None
+                )
+                rendered_meta = (
+                    rendered_html_base / f"{item['key']}.rendered.meta.json"
+                    if rendered_html_base
+                    else None
+                )
+
+                if rendered_html_path and rendered_html_path.exists():
+                    html = rendered_html_path.read_text(encoding="utf-8")
+                    analysis_source = "playwright_rendered_cached"
+                    analyzed_html_path = str(rendered_html_path)
+                    if rendered_meta and not rendered_meta.exists():
+                        write_rendered_meta(
+                            path=rendered_meta,
+                            source_meta=meta,
+                            key=item["key"],
+                            url=url,
+                            archived_html_path=item["html_path"],
+                            rendered_html_path=str(rendered_html_path),
+                            render_mode=render_mode,
+                        )
+                    rendered_meta_path = str(rendered_meta) if rendered_meta else ""
+                    print(f"[RENDER CACHED] {url}")
                 else:
-                    print(f"[RENDER] {url}")
-                try:
-                    html = renderer.render(url)
-                    analysis_source = "playwright_rendered"
+                    if render_mode == "fast" and archived_empty_body:
+                        print(f"[RENDER] archived HTML has empty body: {url}")
+                    else:
+                        print(f"[RENDER] {url}")
+                    try:
+                        html = renderer.render(url)
+                        analysis_source = "playwright_rendered"
 
-                    if rendered_html_base:
-                        rendered_html_path = rendered_html_base / f"{item['key']}.rendered.html"
-                        rendered_html_path.write_text(html, encoding="utf-8")
-                        analyzed_html_path = str(rendered_html_path)
-                except Exception as e:
-                    render_error = str(e)
-                    analysis_source = "render_failed_archived_html"
-                    print(f"[RENDER ERROR] {url} -> {render_error}")
+                        if rendered_html_path:
+                            rendered_html_path.write_text(html, encoding="utf-8")
+                            analyzed_html_path = str(rendered_html_path)
+                            if rendered_meta:
+                                write_rendered_meta(
+                                    path=rendered_meta,
+                                    source_meta=meta,
+                                    key=item["key"],
+                                    url=url,
+                                    archived_html_path=item["html_path"],
+                                    rendered_html_path=str(rendered_html_path),
+                                    render_mode=render_mode,
+                                )
+                                rendered_meta_path = str(rendered_meta)
+                    except Exception as e:
+                        render_error = str(e)
+                        analysis_source = "render_failed_archived_html"
+                        print(f"[RENDER ERROR] {url} -> {render_error}")
 
-            metrics = analyzer.analyze(html=html, url=url)
+            metrics, section_outline = analyzer.analyze(html=html, url=url)
             record = {
                 "key": item["key"],
                 "meta_path": item["meta_path"],
+                "rendered_meta_path": rendered_meta_path,
                 "html_path": analyzed_html_path,
                 "archived_html_path": item["html_path"],
                 "analysis_source": analysis_source,
-                "archived_unrendered_nuxt_shell": archived_unrendered_nuxt_shell,
+                "archived_body_text_length": archived_body_text_length,
+                "archived_empty_body": archived_empty_body,
                 "render_mode": render_mode,
                 "render_error": render_error,
                 "fetched_at": meta.get("fetched_at", ""),
                 "http_status": meta.get("http_status", ""),
                 "content_type": meta.get("content_type", ""),
                 **asdict(metrics),
+                "section_outline": section_outline,
             }
             records.append(record)
             print(f"[ANALYZED] {url}")
@@ -673,6 +871,38 @@ def analyze_archived_html_dir(
     write_metrics_csv(output_csv, records)
     write_metrics_jsonl(output_jsonl, records)
     return records
+
+
+def write_rendered_meta(
+    path: str | Path,
+    source_meta: dict[str, Any],
+    key: str,
+    url: str,
+    archived_html_path: str,
+    rendered_html_path: str,
+    render_mode: str,
+) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    rendered_meta = {
+        **source_meta,
+        "key": key,
+        "url": url,
+        "rendered_at": utc_now_iso(),
+        "render_mode": render_mode,
+        "analysis_source": "playwright_rendered",
+        "archived_html_path": archived_html_path,
+        "rendered_html_path": rendered_html_path,
+        "source_fetched_at": source_meta.get("fetched_at", ""),
+        "source_http_status": source_meta.get("http_status", ""),
+        "source_content_type": source_meta.get("content_type", ""),
+    }
+
+    path.write_text(
+        json.dumps(rendered_meta, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def write_metrics_csv(path: str | Path, records: list[dict[str, Any]]) -> None:
@@ -685,6 +915,10 @@ def write_metrics_csv(path: str | Path, records: list[dict[str, Any]]) -> None:
         "url_depth",
         "title",
         "total_text_length",
+        "body_text_length",
+        "empty_body",
+        "archived_body_text_length",
+        "archived_empty_body",
         "link_count",
         "link_text_ratio",
         "section_count",
@@ -697,14 +931,12 @@ def write_metrics_csv(path: str | Path, records: list[dict[str, Any]]) -> None:
         "h3_count",
         "section_with_heading_ratio",
         "dominant_segmentation_type",
-        "unrendered_nuxt_shell",
-        "archived_unrendered_nuxt_shell",
         "hidden_element_count",
         "accordion_like_count",
         "modal_like_count",
         "js_event_handler_count",
         "script_ui_keyword_count",
-        "js_dynamic_ui_score",
+        "section_outline",
         "http_status",
         "fetched_at",
         "content_type",
@@ -714,6 +946,7 @@ def write_metrics_csv(path: str | Path, records: list[dict[str, Any]]) -> None:
         "html_path",
         "archived_html_path",
         "meta_path",
+        "rendered_meta_path",
     ]
 
     with path.open("w", newline="", encoding="utf-8-sig") as f:
@@ -736,40 +969,65 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Analyze already archived static HTML files."
     )
-    parser.add_argument("--html-dir", default="output/docomo_faq/html")
+    parser.add_argument(
+        "--job",
+        choices=sorted(ANALYZER_JOBS),
+        default=ACTIVE_JOB,
+        help="Analyzer job preset name.",
+    )
+    parser.add_argument("--html-dir", default=None)
     parser.add_argument(
         "--output-csv",
-        default="output/docomo_faq/feature/docomo_faq_feature.csv",
+        default=None,
     )
     parser.add_argument(
         "--output-jsonl",
-        default="output/docomo_faq/feature/docomo_faq_feature.jsonl",
+        default=None,
     )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
         "--render-mode",
         choices=["off", "fast", "precision"],
-        default="fast",
-        help="Playwright rendering strategy: off=disabled, fast=Nuxt shell only, precision=all pages.",
+        default=None,
+        help="Playwright rendering strategy: off=disabled, fast=empty body only, precision=all pages.",
     )
     parser.add_argument(
         "--rendered-html-dir",
-        default="output/docomo_faq/rendered_html",
+        default=None,
         help="Directory to save Playwright-rendered HTML used for analysis.",
     )
     return parser.parse_args()
 
 
+def get_active_job() -> AnalyzerJob:
+    if ACTIVE_JOB not in ANALYZER_JOBS:
+        known_jobs = ", ".join(sorted(ANALYZER_JOBS))
+        raise ValueError(f"Unknown ACTIVE_JOB: {ACTIVE_JOB}. Known jobs: {known_jobs}")
+    return ANALYZER_JOBS[ACTIVE_JOB]
+
+
+def job_from_args(args: argparse.Namespace) -> AnalyzerJob:
+    base_job = ANALYZER_JOBS[args.job]
+    return AnalyzerJob(
+        html_dir=args.html_dir or base_job.html_dir,
+        output_csv=args.output_csv or base_job.output_csv,
+        output_jsonl=args.output_jsonl or base_job.output_jsonl,
+        rendered_html_dir=args.rendered_html_dir or base_job.rendered_html_dir,
+        limit=args.limit,
+        render_mode=args.render_mode or base_job.render_mode,
+    )
+
+
 def main() -> None:
-    args = parse_args()
+    job = job_from_args(parse_args()) if USE_CLI_ARGS else get_active_job()
 
     records = analyze_archived_html_dir(
-        html_dir=args.html_dir,
-        output_csv=args.output_csv,
-        output_jsonl=args.output_jsonl,
-        limit=args.limit,
-        render_mode=args.render_mode,
-        rendered_html_dir=args.rendered_html_dir,
+        html_dir=job.html_dir,
+        output_csv=job.output_csv,
+        output_jsonl=job.output_jsonl,
+        limit=job.limit,
+        render_mode=job.render_mode,
+        rendered_html_dir=job.rendered_html_dir,
     )
     print(f"[DONE] analyzed={len(records)}")
 

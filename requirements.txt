@@ -7,3 +7,4 @@ markdownify
 treelib
 lxml
 requests
+scikit-learn
