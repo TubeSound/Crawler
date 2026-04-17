@@ -75,6 +75,7 @@ class GenericBFSCrawler:
         self.discovered: set[str] = set()
         self.results: list[dict] = []
         self.link_count = 0
+        self.written_link_urls: set[str] = set()
 
     # debugが有効な場合だけログを出力する。
     def log(self, *args):
@@ -141,6 +142,20 @@ class GenericBFSCrawler:
 
         return links[:remaining]
 
+    # まだCSVに出力していないリンクURLだけを残す。
+    def _filter_new_links(self, links: list[dict]) -> list[dict]:
+        new_links = []
+
+        for link in links:
+            url = link["url"]
+            if url in self.written_link_urls:
+                continue
+
+            self.written_link_urls.add(url)
+            new_links.append(link)
+
+        return new_links
+
     # ページタイトルを取得し、取得できない場合はog:titleを使う。
     def _get_title(self, page) -> str:
         try:
@@ -177,7 +192,7 @@ class GenericBFSCrawler:
                 except Exception:
                     text = ""
 
-                key = (norm, text)
+                key = norm
                 if key in seen:
                     continue
                 seen.add(key)
@@ -297,7 +312,7 @@ class GenericBFSCrawler:
             f"url={url}"
         )
 
-        all_links_map = {(x["url"], x["text"]): x for x in before_links}
+        all_links_map = {x["url"]: x for x in before_links}
 
         for idx, locator in enumerate(click_candidates, start=1):
             try:
@@ -333,7 +348,7 @@ class GenericBFSCrawler:
                     self.log(f"  [CLICK #{idx}] no change")
 
                 for item in after_links:
-                    all_links_map[(item["url"], item["text"])] = item
+                    all_links_map[item["url"]] = item
 
             except Exception as e:
                 self.log(f"  [CLICK #{idx}] skipped: {e}")
@@ -465,6 +480,7 @@ class GenericBFSCrawler:
                     page.wait_for_timeout(self.config.initial_wait_ms)
 
                     record = self._extract_page(page, url, depth)
+                    record["links"] = self._filter_new_links(record["links"])
                     record["links"] = self._limit_links(record["links"])
                     self.link_count += len(record["links"])
                     self.results.append(record)
@@ -599,6 +615,6 @@ def gooID():
 if __name__ == "__main__":
     #gooID()
     #goo_point()
-    #ocn_support()
-    docomo_faq()
+    ocn_support()
+    #docomo_faq()
     

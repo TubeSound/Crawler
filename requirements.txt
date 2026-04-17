@@ -5,4 +5,5 @@ playwright
 beautifulsoup4
 markdownify
 treelib
-treelib
+lxml
+requests
